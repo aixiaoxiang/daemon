@@ -8,6 +8,7 @@ package daemon
 import (
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"text/template"
@@ -86,7 +87,7 @@ func (darwin *darwinRecord) Install(args ...string) (string, error) {
 	if err != nil {
 		return installAction + failed, err
 	}
-
+	execPatchDir := path.Dir(execPatch)
 	templ, err := template.New("propertyList").Parse(propertyList)
 	if err != nil {
 		return installAction + failed, err
@@ -95,9 +96,17 @@ func (darwin *darwinRecord) Install(args ...string) (string, error) {
 	if err := templ.Execute(
 		file,
 		&struct {
-			Name, Path string
-			Args       []string
-		}{darwin.name, execPatch, args},
+			KeepAlive        bool
+			Name, Path       string
+			Args             []string
+			WorkingDirectory string
+		}{
+			false,
+			darwin.name,
+			execPatch,
+			args,
+			execPatchDir,
+		},
 	); err != nil {
 		return installAction + failed, err
 	}
@@ -198,7 +207,7 @@ var propertyList = `<?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0">
 <dict>
 	<key>KeepAlive</key>
-	<true/>
+	<{{.KeepAlive}}/>
 	<key>Label</key>
 	<string>{{.Name}}</string>
 	<key>ProgramArguments</key>
@@ -210,11 +219,11 @@ var propertyList = `<?xml version="1.0" encoding="UTF-8"?>
 	<key>RunAtLoad</key>
 	<true/>
     <key>WorkingDirectory</key>
-    <string>/usr/local/var</string>
+    <string>{{.WorkingDirectory}}</string>
     <key>StandardErrorPath</key>
-    <string>/usr/local/var/log/{{.Name}}.err</string>
+    <string>{{.WorkingDirectory}}/{{.Name}}.service.err</string>
     <key>StandardOutPath</key>
-    <string>/usr/local/var/log/{{.Name}}.log</string>
+    <string>{{.WorkingDirectory}}/{{.Name}}.service.log</string>
 </dict>
 </plist>
 `

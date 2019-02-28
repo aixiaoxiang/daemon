@@ -9,7 +9,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/takama/daemon"
+	"github.com/aixiaoxiang/daemon"
 )
 
 const (
