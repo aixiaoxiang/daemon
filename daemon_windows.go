@@ -8,17 +8,20 @@ package daemon
 import (
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
-	"strconv"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
-	"unicode/utf16"
-	"unsafe"
 
-	"golang.org/x/sys/windows/registry"
 	"golang.org/x/sys/windows/svc"
+	"golang.org/x/sys/windows/svc/debug"
+	"golang.org/x/sys/windows/svc/eventlog"
 	"golang.org/x/sys/windows/svc/mgr"
 )
+
+var elog debug.Log
 
 // windowsRecord - standard record (struct) for windows version of daemon package
 type windowsRecord struct {
@@ -28,7 +31,11 @@ type windowsRecord struct {
 }
 
 func newDaemon(name, description string, dependencies []string) (Daemon, error) {
-
+	var err error
+	elog, err = eventlog.Open(name)
+	if err != nil {
+		elog = nil
+	}
 	return &windowsRecord{name, description, dependencies}, nil
 }
 
@@ -39,19 +46,19 @@ func (windows *windowsRecord) Install(args ...string) (string, error) {
 	execp, err := execPath()
 
 	if err != nil {
-		return installAction + failed, err
+		return installAction, err
 	}
 
 	m, err := mgr.Connect()
 	if err != nil {
-		return installAction + failed, err
+		return installAction, err
 	}
 	defer m.Disconnect()
 
 	s, err := m.OpenService(windows.name)
 	if err == nil {
 		s.Close()
-		return installAction + failed, err
+		return installAction, ErrAlreadyRunning
 	}
 
 	s, err = m.CreateService(windows.name, execp, mgr.Config{
@@ -61,10 +68,39 @@ func (windows *windowsRecord) Install(args ...string) (string, error) {
 		Dependencies: windows.dependencies,
 	}, args...)
 	if err != nil {
-		return installAction + failed, err
+		return installAction, err
 	}
 	defer s.Close()
 
+	// set recovery action for service
+	// restart after 5 seconds for the first 3 times
+	// restart after 1 minute, otherwise
+	r := []mgr.RecoveryAction{
+		mgr.RecoveryAction{
+			Type:  mgr.ServiceRestart,
+			Delay: 5000 * time.Millisecond,
+		},
+		mgr.RecoveryAction{
+			Type:  mgr.ServiceRestart,
+			Delay: 5000 * time.Millisecond,
+		},
+		mgr.RecoveryAction{
+			Type:  mgr.ServiceRestart,
+			Delay: 5000 * time.Millisecond,
+		},
+		mgr.RecoveryAction{
+			Type:  mgr.ServiceRestart,
+			Delay: 60000 * time.Millisecond,
+		},
+	}
+	// set reset period as a day
+	s.SetRecoveryActions(r, uint32(86400))
+
+	err = eventlog.InstallAsEventCreate(windows.name, eventlog.Error|eventlog.Warning|eventlog.Info)
+	if err != nil {
+		s.Delete()
+		return installAction, err
+	}
 	return installAction + " completed.", nil
 }
 
@@ -74,19 +110,22 @@ func (windows *windowsRecord) Remove() (string, error) {
 
 	m, err := mgr.Connect()
 	if err != nil {
-		return removeAction + failed, getWindowsError(err)
+		return removeAction, getWindowsError(err)
 	}
 	defer m.Disconnect()
 	s, err := m.OpenService(windows.name)
 	if err != nil {
-		return removeAction + failed, getWindowsError(err)
+		return removeAction, getWindowsError(err)
 	}
 	defer s.Close()
 	err = s.Delete()
 	if err != nil {
-		return removeAction + failed, getWindowsError(err)
+		return removeAction, getWindowsError(err)
 	}
-
+	err = eventlog.Remove(windows.name)
+	if err != nil {
+		return removeAction, getWindowsError(err)
+	}
 	return removeAction + " completed.", nil
 }
 
@@ -96,86 +135,57 @@ func (windows *windowsRecord) Start() (string, error) {
 
 	m, err := mgr.Connect()
 	if err != nil {
-		return startAction + failed, getWindowsError(err)
+		return startAction, getWindowsError(err)
 	}
 	defer m.Disconnect()
 	s, err := m.OpenService(windows.name)
 	if err != nil {
-		return startAction + failed, getWindowsError(err)
+		return startAction, getWindowsError(err)
 	}
 	defer s.Close()
-	if err = s.Start(); err != nil {
-		return startAction + failed, getWindowsError(err)
+	if err = s.Start("is", "manual-started"); err != nil {
+		return startAction, getWindowsError(err)
 	}
-
 	return startAction + " completed.", nil
 }
 
 // Stop the service
 func (windows *windowsRecord) Stop() (string, error) {
 	stopAction := "Stopping " + windows.description + ":"
-
-	m, err := mgr.Connect()
+	err := controlService(windows.name, svc.Stop, svc.Stopped)
 	if err != nil {
-		return stopAction + failed, getWindowsError(err)
+		return stopAction, getWindowsError(err)
 	}
-	defer m.Disconnect()
-	s, err := m.OpenService(windows.name)
-	if err != nil {
-		return stopAction + failed, getWindowsError(err)
-	}
-	defer s.Close()
-	if err := stopAndWait(s); err != nil {
-		return stopAction + failed, getWindowsError(err)
-	}
-
 	return stopAction + " completed.", nil
 }
 
-func stopAndWait(s *mgr.Service) error {
-	// First stop the service. Then wait for the service to
-	// actually stop before starting it.
-	status, err := s.Control(svc.Stop)
+func controlService(name string, c svc.Cmd, to svc.State) error {
+	m, err := mgr.Connect()
 	if err != nil {
 		return err
 	}
-
-	timeDuration := time.Millisecond * 50
-
-	timeout := time.After(getStopTimeout() + (timeDuration * 2))
-	tick := time.NewTicker(timeDuration)
-	defer tick.Stop()
-
-	for status.State != svc.Stopped {
-		select {
-		case <-tick.C:
-			status, err = s.Query()
-			if err != nil {
-				return err
-			}
-		case <-timeout:
-			break
+	defer m.Disconnect()
+	s, err := m.OpenService(name)
+	if err != nil {
+		return fmt.Errorf("could not access service: %v", err)
+	}
+	defer s.Close()
+	status, err := s.Control(c)
+	if err != nil {
+		return fmt.Errorf("could not send control=%d: %v", c, err)
+	}
+	timeout := time.Now().Add(10 * time.Second)
+	for status.State != to {
+		if timeout.Before(time.Now()) {
+			return fmt.Errorf("timeout waiting for service to go to state=%d", to)
+		}
+		time.Sleep(300 * time.Millisecond)
+		status, err = s.Query()
+		if err != nil {
+			return fmt.Errorf("could not retrieve service status: %v", err)
 		}
 	}
 	return nil
-}
-
-func getStopTimeout() time.Duration {
-	// For default and paths see https://support.microsoft.com/en-us/kb/146092
-	defaultTimeout := time.Millisecond * 20000
-	key, err := registry.OpenKey(registry.LOCAL_MACHINE, `SYSTEM\CurrentControlSet\Control`, registry.READ)
-	if err != nil {
-		return defaultTimeout
-	}
-	sv, _, err := key.GetStringValue("WaitToKillServiceTimeout")
-	if err != nil {
-		return defaultTimeout
-	}
-	v, err := strconv.Atoi(sv)
-	if err != nil {
-		return defaultTimeout
-	}
-	return time.Millisecond * time.Duration(v)
 }
 
 // Status - Get service status
@@ -200,20 +210,29 @@ func (windows *windowsRecord) Status() (string, error) {
 
 // Get executable path
 func execPath() (string, error) {
-	var n uint32
-	b := make([]uint16, syscall.MAX_PATH)
-	size := uint32(len(b))
-
-	r0, _, e1 := syscall.MustLoadDLL(
-		"kernel32.dll",
-	).MustFindProc(
-		"GetModuleFileNameW",
-	).Call(0, uintptr(unsafe.Pointer(&b[0])), uintptr(size))
-	n = uint32(r0)
-	if n == 0 {
-		return "", e1
+	prog := os.Args[0]
+	p, err := filepath.Abs(prog)
+	if err != nil {
+		return "", err
 	}
-	return string(utf16.Decode(b[0:n])), nil
+	fi, err := os.Stat(p)
+	if err == nil {
+		if !fi.Mode().IsDir() {
+			return p, nil
+		}
+		err = fmt.Errorf("%s is directory", p)
+	}
+	if filepath.Ext(p) == "" {
+		p += ".exe"
+		fi, err := os.Stat(p)
+		if err == nil {
+			if !fi.Mode().IsDir() {
+				return p, nil
+			}
+			err = fmt.Errorf("%s is directory", p)
+		}
+	}
+	return "", err
 }
 
 // Get windows error
@@ -225,7 +244,6 @@ func getWindowsError(inputError error) error {
 			}
 		}
 	}
-
 	return inputError
 }
 
@@ -257,19 +275,18 @@ type serviceHandler struct {
 func (sh *serviceHandler) Execute(args []string, r <-chan svc.ChangeRequest, changes chan<- svc.Status) (ssec bool, errno uint32) {
 	const cmdsAccepted = svc.AcceptStop | svc.AcceptShutdown | svc.AcceptPauseAndContinue
 	changes <- svc.Status{State: svc.StartPending}
-
 	fasttick := time.Tick(500 * time.Millisecond)
 	slowtick := time.Tick(2 * time.Second)
 	tick := fasttick
-
 	sh.executable.Start()
 	changes <- svc.Status{State: svc.Running, Accepts: cmdsAccepted}
-
+	sh.executable.Run()
 loop:
 	for {
 		select {
 		case <-tick:
-			break
+			// beep()
+			// elog.Info(1, "beep")
 		case c := <-r:
 			switch c.Cmd {
 			case svc.Interrogate:
@@ -278,7 +295,12 @@ loop:
 				time.Sleep(100 * time.Millisecond)
 				changes <- c.CurrentStatus
 			case svc.Stop, svc.Shutdown:
-				changes <- svc.Status{State: svc.StopPending}
+				// golang.org/x/sys/windows/svc.TestExample is verifying this output.
+				if elog != nil {
+					testOutput := strings.Join(args, "-")
+					testOutput += fmt.Sprintf("-%d", c.Context)
+					elog.Info(1, testOutput)
+				}
 				sh.executable.Stop()
 				break loop
 			case svc.Pause:
@@ -288,10 +310,14 @@ loop:
 				changes <- svc.Status{State: svc.Running, Accepts: cmdsAccepted}
 				tick = fasttick
 			default:
+				if elog != nil {
+					elog.Error(1, fmt.Sprintf("unexpected control request #%d", c))
+				}
 				continue loop
 			}
 		}
 	}
+	changes <- svc.Status{State: svc.StopPending}
 	return
 }
 
@@ -317,4 +343,14 @@ func (windows *windowsRecord) Run(e Executable) (string, error) {
 	}
 
 	return runAction + " completed.", nil
+}
+
+// GetTemplate - gets service config template
+func (linux *windowsRecord) GetTemplate() string {
+	return ""
+}
+
+// SetTemplate - sets service config template
+func (linux *windowsRecord) SetTemplate(tplStr string) error {
+	return errors.New(fmt.Sprintf("templating is not supported for windows"))
 }

@@ -1,2 +1,4 @@
 .DS_Store
 go.sum
+examples2/xbookApp.exe
+examples/xbookApp.exe
