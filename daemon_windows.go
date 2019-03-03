@@ -273,7 +273,7 @@ type serviceHandler struct {
 }
 
 func (sh *serviceHandler) Execute(args []string, r <-chan svc.ChangeRequest, changes chan<- svc.Status) (ssec bool, errno uint32) {
-	const cmdsAccepted = svc.AcceptStop | svc.AcceptShutdown | svc.AcceptPauseAndContinue
+	const cmdsAccepted = svc.AcceptStop | svc.AcceptShutdown // | svc.AcceptPauseAndContinue
 	changes <- svc.Status{State: svc.StartPending}
 	fasttick := time.Tick(500 * time.Millisecond)
 	slowtick := time.Tick(2 * time.Second)
@@ -305,8 +305,8 @@ loop:
 					elog.Info(1, testOutput)
 				}
 				sh.executable.Stop()
-				break
-				// break loop
+				changes <- svc.Status{State: svc.StopPending}
+				break loop
 			case svc.Pause:
 				changes <- svc.Status{State: svc.Paused, Accepts: cmdsAccepted}
 				tick = slowtick
