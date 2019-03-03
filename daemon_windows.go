@@ -281,6 +281,9 @@ func (sh *serviceHandler) Execute(args []string, r <-chan svc.ChangeRequest, cha
 	sh.executable.Start()
 	changes <- svc.Status{State: svc.Running, Accepts: cmdsAccepted}
 	sh.executable.Run()
+	if elog != nil {
+		elog.Info(1, "start-run")
+	}
 loop:
 	for {
 		select {
@@ -302,7 +305,8 @@ loop:
 					elog.Info(1, testOutput)
 				}
 				sh.executable.Stop()
-				break loop
+				break
+				// break loop
 			case svc.Pause:
 				changes <- svc.Status{State: svc.Paused, Accepts: cmdsAccepted}
 				tick = slowtick
