@@ -4,7 +4,7 @@ package main
 import (
 	"os"
 
-	"github.com/aixiaoxiang/daemon"
+	"github.com/axfor/daemon"
 )
 
 const (
